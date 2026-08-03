@@ -260,6 +260,10 @@ class LLMAdapter(nn.Module):
     def __init__(self, vocab_size=32128, dim=1024, num_heads=16,
                  head_dim=64, mlp_dim=4096, num_layers=6):
         super().__init__()
+        # NOTE: embed.weight is loaded but UNUSED at inference — it was a training-time
+        # component (likely initialized from T5, given vocab=32128). The Qwen3 tokenizer
+        # has vocab=151936, so embed can't be used for token lookup.
+        # At inference, the adapter takes Qwen3 hidden states directly as input sequence.
         self.embed = nn.Embedding(vocab_size, dim)
         self.blocks = nn.ModuleList([
             AdapterBlock(dim, num_heads, head_dim, mlp_dim)
@@ -268,8 +272,14 @@ class LLMAdapter(nn.Module):
         self.norm = LayerNormNoBias(dim)
         self.out_proj = nn.Linear(dim, dim, bias=True)
 
-    def forward(self, token_ids, qwen3_hidden):
-        x = self.embed(token_ids)
+    def forward(self, qwen3_hidden):
+        """
+        qwen3_hidden: [B, L, 1024]  - hidden states from Qwen3 text encoder
+        Returns: [B, L, 1024] - text features for the main transformer cross-attn
+        """
+        # Skip embed (would cause index out of range with Qwen3 tokenizer)
+        # Use Qwen3 hidden states directly as input sequence
+        x = qwen3_hidden
         for block in self.blocks:
             x = block(x, qwen3_hidden)
         x = self.norm(x)
@@ -364,11 +374,10 @@ class AnimaTransformer(nn.Module):
             num_layers=ll.get("num_layers", 6),
         )
 
-    def forward(self, latents, timestep, token_ids, qwen3_hidden):
+    def forward(self, latents, timestep, qwen3_hidden):
         """
         latents: [B, 16, H, W]
         timestep: [B]
-        token_ids: [B, L]
         qwen3_hidden: [B, L, 1024]
         Returns: noise prediction [B, 16, H, W]
         """
@@ -395,8 +404,8 @@ class AnimaTransformer(nn.Module):
         t_emb = self.t_embedding_norm(t_emb)               # [B, hidden] normalized
         cond = self.t_embedder[1](t_emb)                   # [B, 3*hidden]
 
-        # 5. LLM Adapter → text features
-        text_features = self.llm_adapter(token_ids, qwen3_hidden)
+        # 5. LLM Adapter → text features (no token IDs needed)
+        text_features = self.llm_adapter(qwen3_hidden)
 
         # 6. 28 transformer blocks
         for block in self.blocks:

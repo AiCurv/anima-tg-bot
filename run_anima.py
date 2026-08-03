@@ -263,16 +263,15 @@ def stage2_denoise(embeds_path, args, device, dtype):
             if use_cfg:
                 # Run both conditional and unconditional
                 lat_in = torch.cat([latents, latents], dim=0)
-                tok_in = torch.cat([negative_ids, prompt_ids], dim=0)
                 hid_in = torch.cat([negative_hidden, prompt_hidden], dim=0)
                 t_in = torch.cat([t_batch, t_batch], dim=0)
 
-                noise_pred = transformer(lat_in, t_in, tok_in, hid_in)
+                noise_pred = transformer(lat_in, t_in, hid_in)
                 noise_uncond, noise_cond = noise_pred.chunk(2)
                 noise_pred = noise_uncond + args.cfg * (noise_cond - noise_uncond)
             else:
                 # Turbo mode — just conditional
-                noise_pred = transformer(latents, t_batch, prompt_ids, prompt_hidden)
+                noise_pred = transformer(latents, t_batch, prompt_hidden)
 
             # Flow-match Euler step: x_{t-1} = x_t + (t_{t-1} - t_t) * v
             # where v is the velocity prediction (= noise_pred for flow match)
@@ -292,11 +291,11 @@ def stage2_denoise(embeds_path, args, device, dtype):
     torch.save(latents.cpu(), latents_path)
 
     log("Freeing transformer from RAM...")
-    del transformer, latents, prompt_hidden, prompt_ids
-    del negative_hidden, negative_ids, embeds_data
+    del transformer, latents, prompt_hidden
+    del negative_hidden, embeds_data
     if 'noise_pred' in dir(): del noise_pred
     if use_cfg and 'noise_uncond' in dir():
-        del noise_uncond, noise_cond, lat_in, tok_in, hid_in, t_in
+        del noise_uncond, noise_cond, lat_in, hid_in, t_in
     gc.collect()
     try:
         torch.cuda.empty_cache()
