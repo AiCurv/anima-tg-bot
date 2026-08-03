@@ -5,17 +5,19 @@
 ================================================================================
  Pure-Python Anima (NVIDIA Cosmos-Predict2-2B-Text2Image) inference runner.
 
- Architecture:
-   - Text Encoder: Qwen3 0.6B base (model.safetensors from Anima repo)
-   - Transformer:  Anima (Cosmos2Transformer2DModel architecture)
-   - VAE:          Qwen-Image VAE
+ Architecture (custom — Anima uses non-stock components):
+   - Text Encoder: Qwen3 0.6B base (provides cross-attn context for llm_adapter)
+   - Transformer:  Anima (custom 28-block DiT with integrated llm_adapter)
+       Loaded via custom PyTorch module (anima_model.py) that matches the
+       original ComfyUI-format weight names exactly.
+   - VAE:          Qwen-Image VAE (AutoencoderKLQwenImage)
 
  Memory staging (CRITICAL for 7GB RAM CPU runner):
-   Stage 1 : Load Text Encoder  -> encode prompt  -> free
-   Stage 2 : Load Transformer   -> denoise        -> free
-   Stage 3 : Load VAE           -> decode         -> save image
+   Stage 1 : Load Qwen3 + tokenize  -> save hidden states  -> free
+   Stage 2 : Load Anima Transformer -> denoise              -> free
+   Stage 3 : Load VAE               -> decode               -> save image
 
- NO ComfyUI. NO Docker. NO GPU. Pure Python + diffusers.
+ NO ComfyUI. NO Docker. NO GPU. Pure Python + diffusers + custom model.
 ================================================================================
 """
 
@@ -29,6 +31,10 @@ import traceback
 from pathlib import Path
 
 import torch
+
+# Make sure anima_model.py is importable
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from anima_model import load_anima_transformer, AnimaTransformer, weight_dtype_next
 
 # ---------------------------------------------------------------------------
 #  Banner / log
@@ -74,23 +80,17 @@ def tg_send_photo(bot_token, chat_id, image_path, caption=""):
         return False
 
 # ---------------------------------------------------------------------------
-#  Hugging Face download helpers
+#  Hugging Face helpers
 # ---------------------------------------------------------------------------
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
 def hf_get(repo_id, filename):
-    """Download a single file from HF Hub."""
     from huggingface_hub import hf_hub_download
     log(f"  -> hf: {repo_id} / {filename}")
     return hf_hub_download(repo_id=repo_id, filename=filename, token=HF_TOKEN)
 
 def build_local_component(name, spec):
-    """
-    Build a local directory containing all files needed for from_pretrained().
-    `spec` is a list of dicts:
-      - {repo, file, rename_as}      -- download from HF Hub
-      - {local_path, rename_as}      -- copy from local file in repo
-    """
+    """Build a local directory with files needed for from_pretrained()."""
     local_dir = Path(f"/tmp/anima_components/{name}")
     local_dir.mkdir(parents=True, exist_ok=True)
     for item in spec:
@@ -113,27 +113,24 @@ def build_local_component(name, spec):
 # ---------------------------------------------------------------------------
 #  Pipeline configuration
 # ---------------------------------------------------------------------------
-ANIMA_REPO          = "circlestone-labs/Anima"
-NVIDIA_COSMOS_REPO  = "nvidia/Cosmos-Predict2-2B-Text2Image"
-QWEN3_BASE_REPO     = "Qwen/Qwen3-0.6B-Base"
-QWEN_IMAGE_REPO     = "Qwen/Qwen-Image"
+ANIMA_REPO        = "circlestone-labs/Anima"
+QWEN3_BASE_REPO   = "Qwen/Qwen3-0.6B-Base"
+QWEN_IMAGE_REPO   = "Qwen/Qwen-Image"
 
-# Default to turbo (8 steps, CFG 1) — much faster on CPU
+# Use turbo for CPU (8 steps, CFG 1)
 DIFFUSION_WEIGHT_FILE = "split_files/diffusion_models/anima-turbo-v1.0.safetensors"
 ENCODER_WEIGHT_FILE   = "split_files/text_encoders/qwen_3_06b_base.safetensors"
 VAE_WEIGHT_FILE       = "split_files/vae/qwen_image_vae.safetensors"
 
 # ---------------------------------------------------------------------------
-#  Stage 1: Text Encoder
+#  Stage 1: Qwen3 text encoding
 # ---------------------------------------------------------------------------
 def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
-    """Stage 1 - Text Encoding with Qwen3 0.6B."""
+    """Stage 1 - Run Qwen3 over prompt to get hidden states + token IDs."""
     banner("STAGE 1 / 3  ::  Text Encoder (Qwen3 0.6B)")
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    # Anima repo only ships weights; configs come from local repo files.
-    # Weights must be named `model.safetensors` for transformers to find them.
     local_dir = build_local_component("text_encoder", [
         {"repo": ANIMA_REPO,      "file": ENCODER_WEIGHT_FILE, "rename_as": "model.safetensors"},
         {"local_path": "configs/text_encoder/config.json"},
@@ -149,15 +146,14 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    log("Loading text encoder model...")
-    # CPU-only: skip low_cpu_mem_usage (meta tensors can't be moved on CPU)
+    log("Loading Qwen3 0.6B text encoder...")
     text_encoder = AutoModelForCausalLM.from_pretrained(
         local_dir,
         torch_dtype=dtype,
         trust_remote_code=True,
     )
     text_encoder.eval()
-    log(f"  text_encoder params: {sum(p.numel() for p in text_encoder.parameters())/1e6:.1f}M")
+    log(f"  qwen3 params: {sum(p.numel() for p in text_encoder.parameters())/1e6:.1f}M")
 
     def encode(text):
         inputs = tokenizer(
@@ -169,30 +165,34 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
         ).to(device)
         with torch.no_grad():
             out = text_encoder(**inputs, output_hidden_states=True)
-            # Use last hidden state as prompt embeddings
-            return out.hidden_states[-1], inputs
+            # Use last hidden state as text features
+            hidden = out.hidden_states[-1]
+        return hidden, inputs.input_ids
 
     log(f"Encoding prompt: {prompt[:80]}")
-    prompt_embeds, pos_inputs = encode(prompt)
+    prompt_hidden, prompt_ids = encode(prompt)
 
     if negative_prompt:
-        negative_embeds, _ = encode(negative_prompt)
+        neg_hidden, neg_ids = encode(negative_prompt)
     else:
-        # Use empty string for unconditional (CFG=1 will make this irrelevant)
-        negative_embeds, _ = encode("")
+        # For CFG=1 we don't really need negatives, but keep shape consistent
+        neg_hidden = torch.zeros_like(prompt_hidden)
+        neg_ids = prompt_ids
 
-    log(f"  prompt_embeds shape: {prompt_embeds.shape}")
+    log(f"  prompt_hidden shape: {prompt_hidden.shape}")
+    log(f"  prompt_ids shape:    {prompt_ids.shape}")
 
-    # Save embeddings to disk so we can free the encoder
+    # Save to disk so we can free Qwen3
     embeds_path = "/tmp/anima_prompt_embeds.pt"
     torch.save({
-        "prompt_embeds":   prompt_embeds.cpu(),
-        "negative_embeds": negative_embeds.cpu(),
+        "prompt_hidden":   prompt_hidden.cpu(),
+        "prompt_ids":      prompt_ids.cpu(),
+        "negative_hidden": neg_hidden.cpu(),
+        "negative_ids":    neg_ids.cpu(),
     }, embeds_path)
 
-    # CLEANUP
-    log("Freeing text encoder from RAM...")
-    del text_encoder, prompt_embeds, negative_embeds, pos_inputs
+    log("Freeing Qwen3 from RAM...")
+    del text_encoder, prompt_hidden, prompt_ids, neg_hidden, neg_ids
     gc.collect()
     try:
         torch.cuda.empty_cache()
@@ -203,46 +203,31 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
     return embeds_path
 
 # ---------------------------------------------------------------------------
-#  Stage 2: Transformer (denoising)
+#  Stage 2: Denoising with custom Anima transformer
 # ---------------------------------------------------------------------------
 def stage2_denoise(embeds_path, args, device, dtype):
-    """Stage 2 - Diffusion Transformer denoising."""
+    """Stage 2 - Run the custom Anima transformer denoising loop."""
     banner("STAGE 2 / 3  ::  Diffusion Transformer (Anima)")
-    from diffusers import CosmosTransformer3DModel, FlowMatchEulerDiscreteScheduler
 
-    # Anima repo only ships weights; config comes from local repo file.
-    # Diffusers expects `diffusion_pytorch_model.safetensors`.
-    local_dir = build_local_component("transformer", [
-        {"repo": ANIMA_REPO,
-         "file": DIFFUSION_WEIGHT_FILE,
-         "rename_as": "diffusion_pytorch_model.safetensors"},
-        {"local_path": "configs/transformer/config.json"},
-    ])
+    # 1. Download weights to a known path
+    weights_path = hf_get(ANIMA_REPO, DIFFUSION_WEIGHT_FILE)
 
-    log("Loading transformer (this takes ~60s, ~4GB RAM)...")
-    # NOTE: low_cpu_mem_usage=True creates meta tensors which can't be moved
-    # with .to(device) on CPU. Since we're CPU-only, we skip low_cpu_mem_usage
-    # and skip the explicit .to(device) call — model loads directly to CPU.
-    transformer = CosmosTransformer3DModel.from_pretrained(
-        local_dir,
-        torch_dtype=dtype,
-    )
-    transformer.eval()
-    # Already on CPU (default), no need to call .to(device)
+    # 2. Load custom model (matches Anima weight naming exactly)
+    log("Loading Anima transformer (this takes ~60s, ~4GB RAM)...")
+    transformer = load_anima_transformer(weights_path, dtype=dtype)
     log(f"  transformer params: {sum(p.numel() for p in transformer.parameters())/1e9:.2f}B")
 
-    # Scheduler
-    scheduler = FlowMatchEulerDiscreteScheduler(
-        num_train_timesteps=1000,
-        shift=3.0,
-        use_dynamic_shifting=True,
-        base_image_seq_len=256,
-        max_image_seq_len=4096,
-    )
-    scheduler.set_timesteps(args.steps, device=device)
-    log(f"  scheduler timesteps: {len(scheduler.timesteps)}")
+    # 3. Set up flow-match scheduler manually (avoid diffusers dynamic_shifting issues)
+    # Anima uses FlowMatchEulerDiscrete. For turbo (8 steps, CFG=1), use simple linear schedule.
+    num_train_timesteps = 1000
+    shift = 3.0
+    sigmas = torch.linspace(1, 0, args.steps + 1, device=device)
+    # Apply shift (Cosmos uses shift=3 for image)
+    sigmas = shift * sigmas / (1 + (shift - 1) * sigmas)
+    timesteps = (sigmas[:-1] * num_train_timesteps).long()
+    log(f"  timesteps: {timesteps.tolist()}")
 
-    # Latents - Cosmos2 uses 16-channel VAE latents
+    # 4. Latents - 16-channel VAE latents
     latent_channels = 16
     latent_h = args.height // 8
     latent_w = args.width // 8
@@ -258,10 +243,12 @@ def stage2_denoise(embeds_path, args, device, dtype):
     )
     log(f"  latents shape: {latents.shape}")
 
-    # Load prompt embeds
+    # 5. Load prompt embeds
     embeds_data = torch.load(embeds_path, map_location=device, weights_only=True)
-    prompt_embeds   = embeds_data["prompt_embeds"].to(device=device, dtype=dtype)
-    negative_embeds = embeds_data["negative_embeds"].to(device=device, dtype=dtype)
+    prompt_hidden   = embeds_data["prompt_hidden"].to(device=device, dtype=dtype)
+    prompt_ids      = embeds_data["prompt_ids"].to(device=device)
+    negative_hidden = embeds_data["negative_hidden"].to(device=device, dtype=dtype)
+    negative_ids    = embeds_data["negative_ids"].to(device=device)
 
     use_cfg = args.cfg > 1.0 + 1e-6
     log(f"  CFG: {args.cfg} ({'on' if use_cfg else 'off — turbo mode'})")
@@ -270,39 +257,33 @@ def stage2_denoise(embeds_path, args, device, dtype):
     start = time.time()
 
     with torch.no_grad():
-        for i, t in enumerate(scheduler.timesteps):
-            t_input = t.unsqueeze(0).to(device)
+        for i, t in enumerate(timesteps):
+            t_batch = torch.tensor([float(t)], device=device, dtype=dtype)
 
             if use_cfg:
-                latent_input = torch.cat([latents, latents], dim=0)
-                embed_input  = torch.cat([negative_embeds, prompt_embeds], dim=0)
-            else:
-                latent_input = latents
-                embed_input  = prompt_embeds
+                # Run both conditional and unconditional
+                lat_in = torch.cat([latents, latents], dim=0)
+                tok_in = torch.cat([negative_ids, prompt_ids], dim=0)
+                hid_in = torch.cat([negative_hidden, prompt_hidden], dim=0)
+                t_in = torch.cat([t_batch, t_batch], dim=0)
 
-            try:
-                out = transformer(
-                    latent_input,
-                    t_input,
-                    encoder_hidden_states=embed_input,
-                    return_dict=False,
-                )
-                noise_pred = out[0] if isinstance(out, tuple) else out.sample
-            except Exception as e:
-                log(f"  ! step {i} transformer call failed: {e}")
-                raise
-
-            if use_cfg:
+                noise_pred = transformer(lat_in, t_in, tok_in, hid_in)
                 noise_uncond, noise_cond = noise_pred.chunk(2)
                 noise_pred = noise_uncond + args.cfg * (noise_cond - noise_uncond)
+            else:
+                # Turbo mode — just conditional
+                noise_pred = transformer(latents, t_batch, prompt_ids, prompt_hidden)
 
-            latents = scheduler.step(noise_pred, t, latents).prev_sample
+            # Flow-match Euler step: x_{t-1} = x_t + (t_{t-1} - t_t) * v
+            # where v is the velocity prediction (= noise_pred for flow match)
+            sigma_cur = sigmas[i]
+            sigma_next = sigmas[i + 1]
+            latents = latents + (sigma_next - sigma_cur) * noise_pred
 
-            if (i + 1) % 2 == 0 or i == 0:
-                elapsed = time.time() - start
-                total_est = elapsed / (i + 1) * len(scheduler.timesteps)
-                log(f"  step {i+1}/{len(scheduler.timesteps)}  "
-                    f"elapsed={elapsed:.0f}s  eta={total_est-elapsed:.0f}s")
+            elapsed = time.time() - start
+            total_est = elapsed / (i + 1) * len(timesteps)
+            log(f"  step {i+1}/{len(timesteps)}  "
+                f"elapsed={elapsed:.0f}s  eta={total_est-elapsed:.0f}s")
 
     total = time.time() - start
     log(f"Denoising complete in {total:.1f}s ({total/60:.1f} min)")
@@ -310,18 +291,12 @@ def stage2_denoise(embeds_path, args, device, dtype):
     latents_path = "/tmp/anima_latents.pt"
     torch.save(latents.cpu(), latents_path)
 
-    # CLEANUP
     log("Freeing transformer from RAM...")
-    del transformer, latents, prompt_embeds, negative_embeds, embeds_data
-    try:
-        del noise_pred
-    except NameError:
-        pass
-    if use_cfg:
-        try:
-            del noise_uncond, noise_cond, latent_input, embed_input
-        except NameError:
-            pass
+    del transformer, latents, prompt_hidden, prompt_ids
+    del negative_hidden, negative_ids, embeds_data
+    if 'noise_pred' in dir(): del noise_pred
+    if use_cfg and 'noise_uncond' in dir():
+        del noise_uncond, noise_cond, lat_in, tok_in, hid_in, t_in
     gc.collect()
     try:
         torch.cuda.empty_cache()
@@ -352,10 +327,7 @@ def stage3_decode(latents_path, output_path, device, dtype):
     ])
 
     log("Loading VAE...")
-    vae = VAEClass.from_pretrained(
-        local_dir,
-        torch_dtype=dtype,
-    )
+    vae = VAEClass.from_pretrained(local_dir, torch_dtype=dtype)
     vae.eval()
     log(f"  vae params: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M")
 
@@ -363,11 +335,18 @@ def stage3_decode(latents_path, output_path, device, dtype):
     latents = latents.to(device=device, dtype=dtype)
     log(f"  latents shape: {latents.shape}")
 
-    scaling_factor = getattr(vae.config, "scaling_factor", 0.13025)
-    log(f"  vae scaling_factor: {scaling_factor}")
+    # Qwen-Image VAE uses latents_mean/std normalization
+    # Get from config if available
+    latents_mean = getattr(vae.config, "latents_mean", None)
+    latents_std  = getattr(vae.config, "latents_std", None)
+    if latents_mean is not None and latents_std is not None:
+        latents_mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
+        latents_std  = torch.tensor(latents_std,  device=device, dtype=dtype).view(1, -1, 1, 1)
+        latents = (latents - latents_mean) / latents_std
+        log("  applied latents_mean/std normalization")
 
     with torch.no_grad():
-        image = vae.decode(latents / scaling_factor, return_dict=False)[0]
+        image = vae.decode(latents, return_dict=False)[0]
 
     image = (image / 2 + 0.5).clamp(0, 1)
     image = image.cpu().permute(0, 2, 3, 1).numpy()
@@ -424,6 +403,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = torch.float32  # CPU mode
     log(f"Device: {device}  |  dtype: {dtype}")
+
+    # Set the global weight_dtype_next for timestep_embedding
+    import anima_model
+    anima_model.weight_dtype_next = dtype
 
     start = time.time()
     try:
