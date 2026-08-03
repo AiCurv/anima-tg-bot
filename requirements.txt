@@ -1,0 +1,26 @@
+# =====================================================================
+# telegram-anima-diffusion-bot :: requirements.txt
+# CPU-only PyTorch + diffusers + transformers
+# NO ComfyUI, NO xformers, NO GPU-only deps
+# =====================================================================
+
+# Core PyTorch (CPU-only wheel - much smaller than CUDA wheel)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1
+torchvision==0.19.1
+
+# Diffusion pipeline (must be >=0.32 for Cosmos2Transformer2DModel)
+diffusers==0.32.1
+transformers==4.46.3
+accelerate==1.1.1
+huggingface_hub==0.26.2
+safetensors==0.4.5
+
+# Image / utility
+Pillow==10.4.0
+numpy==1.26.4
+requests==2.32.3
+
+# Sentencepiece (Qwen tokenizer requirement)
+sentencepiece==0.2.0
+protobuf==5.28.3

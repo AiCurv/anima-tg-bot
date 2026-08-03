@@ -1,0 +1,16 @@
+{
+  "name": "telegram-anima-diffusion-bot-worker",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker webhook router for Telegram -> GitHub Actions -> Anima T2I",
+  "main": "src/index.js",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

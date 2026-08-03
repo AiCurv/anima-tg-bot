@@ -1,0 +1,27 @@
+# =============================================================================
+# telegram-anima-diffusion-bot :: wrangler.toml (Cloudflare Worker config)
+# =============================================================================
+# Deploy:
+#   cd worker && npx wrangler deploy
+#
+# After deploy, set the webhook:
+#   curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<WORKER>.<SUBDOMAIN>.workers.dev/webhook"
+# =============================================================================
+
+name = "telegram-anima-bot"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# Worker will be deployed at: https://telegram-anima-bot.<your-subdomain>.workers.dev
+
+# ----------------------------------------------------------------------------
+#  Secrets (do NOT commit these — set via `wrangler secret put <NAME>`)
+# ----------------------------------------------------------------------------
+# Required secrets:
+#   wrangler secret put TELEGRAM_BOT_TOKEN
+#   wrangler secret put ALLOWED_TELEGRAM_USER_ID
+#   wrangler secret put GITHUB_TOKEN
+#   wrangler secret put GITHUB_REPO            # e.g. "your-username/telegram-anima-diffusion-bot"
+
+[vars]
+# Non-secret config can go here if needed
