@@ -9,12 +9,14 @@
 torch==2.4.1
 torchvision==0.19.1
 
-# Diffusion pipeline (must be >=0.32 for Cosmos2Transformer2DModel)
-# transformers must be >=4.51 for Qwen3 support
+# Diffusion pipeline
+# diffusers >= 0.32 for Cosmos2Transformer2DModel
+# transformers >= 4.51 for Qwen3
+# huggingface_hub >= 0.30 required by transformers 4.51
 diffusers==0.32.1
 transformers==4.51.3
 accelerate==1.1.1
-huggingface_hub==0.26.2
+huggingface_hub==0.30.2
 safetensors==0.4.5
 
 # Image / utility
