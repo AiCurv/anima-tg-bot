@@ -90,8 +90,8 @@ jobs:
             --chat-id "$CHAT_CLEAN" \
             --width 1024 \
             --height 1024 \
-            --steps 30 \
-            --cfg 4.5 \
+            --steps 8 \
+            --cfg 1.0 \
             --seed -1
           if [ ! -f output.png ]; then
             echo "::error::output.png was not produced"
