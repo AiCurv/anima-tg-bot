@@ -150,14 +150,13 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
         tokenizer.pad_token = tokenizer.eos_token
 
     log("Loading text encoder model...")
+    # CPU-only: skip low_cpu_mem_usage (meta tensors can't be moved on CPU)
     text_encoder = AutoModelForCausalLM.from_pretrained(
         local_dir,
         torch_dtype=dtype,
-        low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
     text_encoder.eval()
-    text_encoder.to(device)
     log(f"  text_encoder params: {sum(p.numel() for p in text_encoder.parameters())/1e6:.1f}M")
 
     def encode(text):
@@ -221,13 +220,15 @@ def stage2_denoise(embeds_path, args, device, dtype):
     ])
 
     log("Loading transformer (this takes ~60s, ~4GB RAM)...")
+    # NOTE: low_cpu_mem_usage=True creates meta tensors which can't be moved
+    # with .to(device) on CPU. Since we're CPU-only, we skip low_cpu_mem_usage
+    # and skip the explicit .to(device) call — model loads directly to CPU.
     transformer = CosmosTransformer3DModel.from_pretrained(
         local_dir,
         torch_dtype=dtype,
-        low_cpu_mem_usage=True,
     )
     transformer.eval()
-    transformer.to(device)
+    # Already on CPU (default), no need to call .to(device)
     log(f"  transformer params: {sum(p.numel() for p in transformer.parameters())/1e9:.2f}B")
 
     # Scheduler
@@ -354,10 +355,8 @@ def stage3_decode(latents_path, output_path, device, dtype):
     vae = VAEClass.from_pretrained(
         local_dir,
         torch_dtype=dtype,
-        low_cpu_mem_usage=True,
     )
     vae.eval()
-    vae.to(device)
     log(f"  vae params: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M")
 
     latents = torch.load(latents_path, map_location=device, weights_only=True)
