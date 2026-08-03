@@ -202,7 +202,7 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
 def stage2_denoise(embeds_path, args, device, dtype):
     """Stage 2 - Diffusion Transformer denoising."""
     banner("STAGE 2 / 3  ::  Diffusion Transformer (Anima)")
-    from diffusers import Cosmos2Transformer2DModel, FlowMatchEulerDiscreteScheduler
+    from diffusers import CosmosTransformer3DModel, FlowMatchEulerDiscreteScheduler
 
     # Anima repo only ships weights; config comes from NVIDIA Cosmos-Predict2.
     # Diffusers expects `diffusion_pytorch_model.safetensors`.
@@ -214,7 +214,7 @@ def stage2_denoise(embeds_path, args, device, dtype):
     ])
 
     log("Loading transformer (this takes ~60s, ~4GB RAM)...")
-    transformer = Cosmos2Transformer2DModel.from_pretrained(
+    transformer = CosmosTransformer3DModel.from_pretrained(
         local_dir,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
