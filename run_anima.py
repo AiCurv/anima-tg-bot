@@ -87,20 +87,27 @@ def hf_get(repo_id, filename):
 def build_local_component(name, spec):
     """
     Build a local directory containing all files needed for from_pretrained().
-    `spec` is a list of dicts: {repo, file, rename_as}
-      - repo: HF repo id
-      - file: source filename in that repo
-      - rename_as: (optional) what to call it in the local dir
+    `spec` is a list of dicts:
+      - {repo, file, rename_as}      -- download from HF Hub
+      - {local_path, rename_as}      -- copy from local file in repo
     """
     local_dir = Path(f"/tmp/anima_components/{name}")
     local_dir.mkdir(parents=True, exist_ok=True)
     for item in spec:
-        src = hf_get(item["repo"], item["file"])
-        dst_name = item.get("rename_as") or Path(item["file"]).name
-        dst = local_dir / dst_name
-        if not dst.exists():
-            shutil.copy(src, dst)
-            log(f"  -> staged: {dst_name}")
+        if "local_path" in item:
+            src = Path(item["local_path"])
+            dst_name = item.get("rename_as") or src.name
+            dst = local_dir / dst_name
+            if not dst.exists():
+                shutil.copy(src, dst)
+                log(f"  -> staged (local): {dst_name}")
+        else:
+            src = hf_get(item["repo"], item["file"])
+            dst_name = item.get("rename_as") or Path(item["file"]).name
+            dst = local_dir / dst_name
+            if not dst.exists():
+                shutil.copy(src, dst)
+                log(f"  -> staged: {dst_name}")
     return str(local_dir)
 
 # ---------------------------------------------------------------------------
@@ -125,11 +132,11 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    # Anima repo only ships weights; configs come from Qwen3-0.6B-Base.
+    # Anima repo only ships weights; configs come from local repo files.
     # Weights must be named `model.safetensors` for transformers to find them.
     local_dir = build_local_component("text_encoder", [
         {"repo": ANIMA_REPO,      "file": ENCODER_WEIGHT_FILE, "rename_as": "model.safetensors"},
-        {"repo": QWEN3_BASE_REPO, "file": "config.json"},
+        {"local_path": "configs/text_encoder/config.json"},
         {"repo": QWEN3_BASE_REPO, "file": "tokenizer_config.json"},
         {"repo": QWEN3_BASE_REPO, "file": "tokenizer.json"},
         {"repo": QWEN3_BASE_REPO, "file": "vocab.json"},
@@ -204,13 +211,13 @@ def stage2_denoise(embeds_path, args, device, dtype):
     banner("STAGE 2 / 3  ::  Diffusion Transformer (Anima)")
     from diffusers import CosmosTransformer3DModel, FlowMatchEulerDiscreteScheduler
 
-    # Anima repo only ships weights; config comes from NVIDIA Cosmos-Predict2.
+    # Anima repo only ships weights; config comes from local repo file.
     # Diffusers expects `diffusion_pytorch_model.safetensors`.
     local_dir = build_local_component("transformer", [
         {"repo": ANIMA_REPO,
          "file": DIFFUSION_WEIGHT_FILE,
          "rename_as": "diffusion_pytorch_model.safetensors"},
-        {"repo": NVIDIA_COSMOS_REPO, "file": "transformer/config.json"},
+        {"local_path": "configs/transformer/config.json"},
     ])
 
     log("Loading transformer (this takes ~60s, ~4GB RAM)...")
@@ -329,17 +336,22 @@ def stage2_denoise(embeds_path, args, device, dtype):
 def stage3_decode(latents_path, output_path, device, dtype):
     """Stage 3 - VAE Decode to image."""
     banner("STAGE 3 / 3  ::  VAE Decoder (Qwen-Image)")
-    from diffusers import AutoencoderKL
+    try:
+        from diffusers import AutoencoderKLQwenImage as VAEClass
+        log("Using AutoencoderKLQwenImage")
+    except ImportError:
+        from diffusers import AutoencoderKL as VAEClass
+        log("AutoencoderKLQwenImage not available, falling back to AutoencoderKL")
 
     local_dir = build_local_component("vae", [
         {"repo": ANIMA_REPO,
          "file": VAE_WEIGHT_FILE,
          "rename_as": "diffusion_pytorch_model.safetensors"},
-        {"repo": QWEN_IMAGE_REPO, "file": "vae/config.json"},
+        {"local_path": "configs/vae/config.json"},
     ])
 
     log("Loading VAE...")
-    vae = AutoencoderKL.from_pretrained(
+    vae = VAEClass.from_pretrained(
         local_dir,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
