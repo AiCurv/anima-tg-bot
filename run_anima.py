@@ -28,6 +28,8 @@ import argparse
 import traceback
 from pathlib import Path
 
+import torch
+
 # ---------------------------------------------------------------------------
 #  Banner / log
 # ---------------------------------------------------------------------------
@@ -177,7 +179,6 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
 
     # Save embeddings to disk so we can free the encoder
     embeds_path = "/tmp/anima_prompt_embeds.pt"
-    import torch
     torch.save({
         "prompt_embeds":   prompt_embeds.cpu(),
         "negative_embeds": negative_embeds.cpu(),
@@ -188,7 +189,6 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
     del text_encoder, prompt_embeds, negative_embeds, pos_inputs
     gc.collect()
     try:
-        import torch
         torch.cuda.empty_cache()
     except Exception:
         pass
@@ -202,7 +202,6 @@ def stage1_encode_prompt(prompt, negative_prompt, device, dtype):
 def stage2_denoise(embeds_path, args, device, dtype):
     """Stage 2 - Diffusion Transformer denoising."""
     banner("STAGE 2 / 3  ::  Diffusion Transformer (Anima)")
-    import torch
     from diffusers import Cosmos2Transformer2DModel, FlowMatchEulerDiscreteScheduler
 
     # Anima repo only ships weights; config comes from NVIDIA Cosmos-Predict2.
@@ -330,7 +329,6 @@ def stage2_denoise(embeds_path, args, device, dtype):
 def stage3_decode(latents_path, output_path, device, dtype):
     """Stage 3 - VAE Decode to image."""
     banner("STAGE 3 / 3  ::  VAE Decoder (Qwen-Image)")
-    import torch
     from diffusers import AutoencoderKL
 
     local_dir = build_local_component("vae", [
@@ -412,7 +410,6 @@ def main():
         f"⏱ CPU mode — ETA ~5-10 min (turbo)"
     )
 
-    import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype  = torch.float32  # CPU mode
     log(f"Device: {device}  |  dtype: {dtype}")
