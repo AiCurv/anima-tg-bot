@@ -392,8 +392,8 @@ class AnimaTransformer(nn.Module):
         # t_embedder[0] is Identity (we pre-compute sinusoidal embedding externally)
         # t_embedder[1] is TEmbedderMLP
         t_emb = timestep_embedding(timestep, self.hidden)  # [B, hidden]
+        t_emb = self.t_embedding_norm(t_emb)               # [B, hidden] normalized
         cond = self.t_embedder[1](t_emb)                   # [B, 3*hidden]
-        cond = self.t_embedding_norm(cond)                 # [B, 3*hidden]
 
         # 5. LLM Adapter → text features
         text_features = self.llm_adapter(token_ids, qwen3_hidden)
