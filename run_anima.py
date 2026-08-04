@@ -360,13 +360,8 @@ def stage3_decode(latents_path, output_path, device, dtype):
     log("Loading VAE...")
     vae = VAEClass.from_pretrained(local_dir, torch_dtype=dtype)
     vae.eval()
-    # Enable tiling to fit in 7GB RAM for 1024x1024 images
-    if hasattr(vae, "enable_tiling"):
-        try:
-            vae.enable_tiling()
-            log("  enabled VAE tiling (memory-saving)")
-        except Exception:
-            pass
+    # NOTE: enable_tiling() is GPU-only — it creates meta device tensors that crash on CPU.
+    # At 512x512 the VAE fits in 7GB RAM without tiling.
     log(f"  vae params: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M")
 
     # Load latents produced by the transformer (4D: [B, C, H, W])
@@ -430,8 +425,8 @@ def main():
     parser.add_argument("--negative-prompt", default="worst quality, low quality")
     parser.add_argument("--output",          default="output.png")
     parser.add_argument("--chat-id",         default="")
-    parser.add_argument("--width",           type=int,   default=1024)
-    parser.add_argument("--height",          type=int,   default=1024)
+    parser.add_argument("--width",           type=int,   default=512)
+    parser.add_argument("--height",          type=int,   default=512)
     parser.add_argument("--steps",           type=int,   default=8)
     parser.add_argument("--cfg",             type=float, default=1.0)
     parser.add_argument("--seed",            type=int,   default=-1)
