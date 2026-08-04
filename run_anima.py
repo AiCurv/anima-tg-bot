@@ -359,9 +359,15 @@ def stage3_decode(latents_path, output_path, device, dtype):
 
     log("Loading VAE...")
     vae = VAEClass.from_pretrained(local_dir, torch_dtype=dtype)
+    # Force-load weights from safetensors to bypass accelerate meta-device bug
+    from safetensors.torch import load_file as _sf_load
+    _vae_st = Path(local_dir) / "diffusion_pytorch_model.safetensors"
+    if _vae_st.exists():
+        log("  Loading VAE weights directly from safetensors (bypass meta)...")
+        vae.load_state_dict(_sf_load(str(_vae_st)), strict=False)
+        del _sf_load
     vae.eval()
-    # NOTE: enable_tiling() is GPU-only — it creates meta device tensors that crash on CPU.
-    # At 512x512 the VAE fits in 7GB RAM without tiling.
+    # NOTE: enable_tiling() is GPU-only — not needed at 512x512 on CPU.
     log(f"  vae params: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M")
 
     # Load latents produced by the transformer (4D: [B, C, H, W])
