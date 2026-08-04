@@ -12,11 +12,11 @@ torchvision==0.19.1
 # Diffusion pipeline
 # diffusers >= 0.35 for AutoencoderKLQwenImage (Qwen-Image VAE)
 # transformers >= 4.51 for Qwen3
-# huggingface_hub >= 0.30 required by transformers 4.51
+# huggingface_hub >= 0.34 required by diffusers 0.35
 diffusers==0.35.0
 transformers==4.51.3
 accelerate==1.1.1
-huggingface_hub==0.30.2
+huggingface_hub>=0.34.0
 safetensors==0.4.5
 
 # Image / utility
