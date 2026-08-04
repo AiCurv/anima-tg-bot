@@ -309,15 +309,33 @@ def stage2_denoise(embeds_path, args, device, dtype):
 #  Stage 3: VAE decode
 # ---------------------------------------------------------------------------
 def stage3_decode(latents_path, output_path, device, dtype):
-    """Stage 3 - VAE Decode to image."""
-    banner("STAGE 3 / 3  ::  VAE Decoder (Qwen-Image)")
-    try:
-        from diffusers import AutoencoderKLQwenImage as VAEClass
-        log("Using AutoencoderKLQwenImage")
-    except ImportError:
-        from diffusers import AutoencoderKL as VAEClass
-        log("AutoencoderKLQwenImage not available, falling back to AutoencoderKL")
+    """Stage 3 - VAE Decode to image.
 
+    The Qwen-Image VAE (a.k.a. AutoencoderKLWan-compatible 3D VAE) requires:
+      - 5D input: [B, C, T, H, W]  (we add T=1 for a single image)
+      - DENORMALIZATION before decode:  latents = latents * std + mean
+        (the diffusion model produces normalized latents; VAE expects raw latents)
+      - Output is [B, 3, T, H, W]; we take frame 0 -> [B, 3, H, W]
+    """
+    banner("STAGE 3 / 3  ::  VAE Decoder (Qwen-Image)")
+
+    # Try the native class first (diffusers >= 0.35), fall back to Wan (same architecture)
+    VAEClass = None
+    vae_class_name = None
+    for cls_name in ["AutoencoderKLQwenImage", "AutoencoderKLWan"]:
+        try:
+            VAEClass = getattr(__import__("diffusers"), cls_name)
+            vae_class_name = cls_name
+            log(f"Using {cls_name}")
+            break
+        except (ImportError, AttributeError):
+            continue
+    if VAEClass is None:
+        from diffusers import AutoencoderKL as VAEClass
+        vae_class_name = "AutoencoderKL"
+        log("Falling back to AutoencoderKL (may not match Qwen-Image VAE)")
+
+    # Make sure config _class_name matches the class we're using
     local_dir = build_local_component("vae", [
         {"repo": ANIMA_REPO,
          "file": VAE_WEIGHT_FILE,
@@ -325,28 +343,65 @@ def stage3_decode(latents_path, output_path, device, dtype):
         {"local_path": "configs/vae/config.json"},
     ])
 
+    # Patch the config _class_name to match VAEClass (in-place copy in /tmp)
+    import json
+    vae_cfg_path = Path(local_dir) / "config.json"
+    try:
+        with open(vae_cfg_path) as f:
+            vae_cfg = json.load(f)
+        if vae_cfg.get("_class_name") != vae_class_name:
+            vae_cfg["_class_name"] = vae_class_name
+            with open(vae_cfg_path, "w") as f:
+                json.dump(vae_cfg, f, indent=2)
+            log(f"  patched config _class_name -> {vae_class_name}")
+    except Exception as e:
+        log(f"  (warn) could not patch config: {e}")
+
     log("Loading VAE...")
     vae = VAEClass.from_pretrained(local_dir, torch_dtype=dtype)
     vae.eval()
+    # Enable tiling to fit in 7GB RAM for 1024x1024 images
+    if hasattr(vae, "enable_tiling"):
+        try:
+            vae.enable_tiling()
+            log("  enabled VAE tiling (memory-saving)")
+        except Exception:
+            pass
     log(f"  vae params: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M")
 
+    # Load latents produced by the transformer (4D: [B, C, H, W])
     latents = torch.load(latents_path, map_location=device, weights_only=True)
     latents = latents.to(device=device, dtype=dtype)
-    log(f"  latents shape: {latents.shape}")
+    log(f"  latents shape (from transformer): {latents.shape}")
 
-    # Qwen-Image VAE uses latents_mean/std normalization
-    # Get from config if available
+    # Add temporal dim: [B, C, H, W] -> [B, C, 1, H, W]
+    if latents.dim() == 4:
+        latents = latents.unsqueeze(2)
+    log(f"  latents shape (for VAE): {latents.shape}")
+
+    # DENORMALIZE: latents = latents * std + mean
+    # (diffusion model produces normalized latents; VAE expects raw latents)
     latents_mean = getattr(vae.config, "latents_mean", None)
-    latents_std  = getattr(vae.config, "latents_std", None)
+    latents_std  = getattr(vae.config, "latents_std",  None)
     if latents_mean is not None and latents_std is not None:
-        latents_mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(1, -1, 1, 1)
-        latents_std  = torch.tensor(latents_std,  device=device, dtype=dtype).view(1, -1, 1, 1)
-        latents = (latents - latents_mean) / latents_std
-        log("  applied latents_mean/std normalization")
+        z_dim = getattr(vae.config, "z_dim", latents.shape[1])
+        latents_mean = torch.tensor(latents_mean, device=device, dtype=dtype).view(1, z_dim, 1, 1, 1)
+        latents_std  = torch.tensor(latents_std,  device=device, dtype=dtype).view(1, z_dim, 1, 1, 1)
+        latents = latents * latents_std + latents_mean
+        log("  applied DENORMALIZATION (latents * std + mean)")
+    else:
+        log("  (warn) no latents_mean/std in config — skipping denormalization")
 
     with torch.no_grad():
-        image = vae.decode(latents, return_dict=False)[0]
+        decoded = vae.decode(latents, return_dict=False)[0]
+    # decoded shape: [B, 3, T, H, W]  — take frame 0
+    if decoded.dim() == 5:
+        image = decoded[:, :, 0]
+    else:
+        image = decoded
+    log(f"  decoded image shape: {image.shape}")
 
+    # Convert to PIL: scale [-1, 1] -> [0, 1]
     image = (image / 2 + 0.5).clamp(0, 1)
     image = image.cpu().permute(0, 2, 3, 1).numpy()
     image = (image * 255).round().astype("uint8")
@@ -356,7 +411,7 @@ def stage3_decode(latents_path, output_path, device, dtype):
     pil.save(output_path, format="PNG", optimize=True)
     log(f"  saved: {output_path} ({pil.size[0]}x{pil.size[1]})")
 
-    del vae, latents, image
+    del vae, latents, image, decoded
     gc.collect()
     try:
         torch.cuda.empty_cache()
